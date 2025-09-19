@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Noise Event Logger – iOS (A/C/Z)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:system-ui,sans-serif;margin:16px}
+  .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:12px 0}
+  .controls label{display:flex;gap:6px;align-items:center}
+  .readouts{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;margin:12px 0}
+  .meter{background:#f5f5f5;padding:8px 12px;border-radius:8px}
+  .meter div:last-child{font-weight:700;font-size:1.2rem}
+  .rec{display:flex;align-items:center;gap:8px;font-weight:700}
+  #recDot{color:#aaa}
+  #recDot.on{color:#e53935;animation:pulse 1s infinite}
+  @keyframes pulse{0%{opacity:1}50%{opacity:.4}100%{opacity:1}}
+  table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #e9e9e9;padding:8px;text-align:left}
+  td a{text-decoration:none}.pill{display:inline-block;padding:2px 8px;border-radius:12px;background:#eef;border:1px solid #dde}
+  button{padding:8px 12px;border-radius:8px;border:1px solid #ddd;background:#fff;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  small.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+</style>
+</head>
+<body>
+<header>
+  <h1>Noise Event Logger – iOS</h1>
+  <p>Registrazione + dB(A/C/Z) spettrali + anomalie + micro-clip (WAV) + classificazione euristica</p>
+</header>
+
+<section class="controls">
+  <button id="btnStart">Avvia</button>
+  <button id="btnStop" disabled>Stop</button>
+  <button id="btnMark" disabled>Segna evento</button>
+
+  <label>Ponderazione:
+    <select id="weighting">
+      <option value="A" selected>A</option>
+      <option value="C">C</option>
+      <option value="Z">Z (flat)</option>
+    </select>
+  </label>
+
+  <label>Offset dB:
+    <input id="calOffset" type="number" value="0" step="0.5">
+  </label>
+  <label>Soglia z:
+    <input id="zThresh" type="number" value="3" step="0.5">
+  </label>
+  <label>Durata min (s):
+    <input id="minDur" type="number" value="0.5" step="0.1">
+  </label>
+  <label>Clip (s):
+    <input id="clipDur" type="number" value="3" step="0.5">
+  </label>
+</section>
+
+<section class="readouts">
+  <div class="meter"><div>Istante [dB(A/C/Z) rel.]</div><div id="lvl">--</div></div>
+  <div class="meter"><div>Media 60 s</div><div id="avg">--</div></div>
+  <div class="meter"><div>z-score</div><div id="zsc">--</div></div>
+  <div class="rec"><span id="recDot">●</span><span id="recTxt">Inattivo</span></div>
+</section>
+
+<section>
+  <h2>Eventi</h2>
+  <table id="events">
+    <thead><tr><th>Orario</th><th>Tipo</th><th>dB(A/C/Z)</th><th>z</th><th>Clip</th><th>Note</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+    <button id="btnExportCSV" disabled>Esporta CSV</button>
+    <button id="btnExportJSON" disabled>Esporta JSON</button>
+    <a id="audioLink" href="#" download="registrazione" hidden>Scarica audio completo</a>
+  </div>
+  <p><small>Richiede HTTPS o <span class="mono">http://localhost</span> su iPhone. Questo è un logger di supporto, non IEC 61672.</small></p>
+</section>
+
+<script>
+(function(){
+  // UI refs
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnMark  = document.getElementById('btnMark');
+  const btnCSV   = document.getElementById('btnExportCSV');
+  const btnJSON  = document.getElementById('btnExportJSON');
+  const audioLink= document.getElementById('audioLink');
+
+  const weightingEl = document.getElementById('weighting');
+  const calOffEl = document.getElementById('calOffset');
+  const zThreshEl= document.getElementById('zThresh');
+  const minDurEl = document.getElementById('minDur');
+  const clipDurEl= document.getElementById('clipDur');
+
+  const lvlEl = document.getElementById('lvl');
+  const avgEl = document.getElementById('avg');
+  const zEl   = document.getElementById('zsc');
+  const recDot= document.getElementById('recDot');
+  const recTxt= document.getElementById('recTxt');
+  const eventsTbody = document.querySelector('#events tbody');
+
+  let audioCtx, analyserFreq, micSrc;
+  let mediaRecorder=null, recChunks=[];
+  let running=false, segmentStart=null;
+  let rolling=[], events=[];
+  const ROLLING_SEC=60, HZ=10;
+
+  // ===== Ponderazioni spettrali =====
+  function A_weight_db(f){
+    if (f<=0) return -200;
+    const f2=f*f;
+    const num=(12200*12200)*f2*f2;
+    const den=(f2+20.6*20.6)*Math.sqrt((f2+107.7*107.7)*(f2+737.9*737.9))*(f2+12200*12200);
+    const RA=num/den;
+    return 20*Math.log10(RA)+2.0;
+  }
+  function C_weight_db(f){
+    if (f<=0) return -200;
+    const f2=f*f;
+    const num=(12200*12200)*f2;
+    const den=(f2+20.6*20.6)*(f2+12200*12200);
+    const RC=num/den;
+    return 20*Math.log10(RC)+0.06;
+  }
+  function Z_weight_db(_f){ return 0; } // piatto
+
+  function dB_weighted_from_spectrum(spectrumDB, sr, mode){
+    const n=spectrumDB.length, binHz=sr/(2*n);
+    let sumP=0;
+    for (let i=1;i<n;i++){
+      const f=i*binHz;
+      let WdB=0;
+      if (mode==='A') WdB=A_weight_db(f);
+      else if (mode==='C') WdB=C_weight_db(f);
+      else WdB=0;
+      const lin = Math.pow(10, spectrumDB[i]/10);
+      const w   = Math.pow(10, WdB/10);
+      sumP += lin*w;
+    }
+    return (sumP>0) ? 10*Math.log10(sumP) : -120;
+  }
+
+  // === Stats & util ===
+  function stats(arr){
+    const n=arr.length; if(!n) return {mean:0,std:1};
+    let m=0; for(const x of arr) m+=x; m/=n;
+    let v=0; for(const x of arr){ const d=x-m; v+=d*d; }
+    v=Math.sqrt(v/Math.max(1,n-1));
+    return {mean:m,std:v||1};
+  }
+  function nowT(){ return new Date().toLocaleTimeString(); }
+
+  // === Ring buffer per micro-clip (PCM) + WAV encoder ===
+  let ringBuf=null, ringWrite=0, ringLen=0, ch=1, sr=48000;
+  function setupRing(sampleRate, seconds){
+    sr=sampleRate; ch=1;
+    ringLen=Math.max(1, Math.floor(sampleRate*seconds));
+    ringBuf=new Float32Array(ringLen);
+    ringWrite=0;
+  }
+  function ringPush(block){
+    const n=block.length;
+    for(let i=0;i<n;i++){
+      ringBuf[ringWrite++] = block[i];
+      if (ringWrite>=ringLen) ringWrite=0;
+    }
+  }
+  function ringGrab(seconds){
+    const n=Math.min(ringLen, Math.floor(seconds*sr));
+    const out=new Float32Array(n);
+    let idx=(ringWrite - n); while(idx<0) idx+=ringLen;
+    for(let i=0;i<n;i++) out[i]=ringBuf[(idx+i)%ringLen];
+    return out;
+  }
+  function floatTo16LEPCM(float32){
+    const n=float32.length;
+    const buf=new ArrayBuffer(44 + n*2);
+    const view=new DataView(buf);
+    function wstr(off,s){ for(let i=0;i<s.length;i++) view.setUint8(off+i, s.charCodeAt(i)); }
+    const blockAlign=ch*2, byteRate=sr*blockAlign;
+    wstr(0,'RIFF'); view.setUint32(4,36+n*2,true); wstr(8,'WAVE');
+    wstr(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true);
+    view.setUint16(22,ch,true); view.setUint32(24,sr,true);
+    view.setUint32(28,byteRate,true); view.setUint16(32,blockAlign,true); view.setUint16(34,16,true);
+    wstr(36,'data'); view.setUint32(40,n*2,true);
+    let off=44;
+    for(let i=0;i<n;i++){ let s=Math.max(-1,Math.min(1,float32[i])); view.setInt16(off, s<0 ? s*0x8000 : s*0x7FFF, true); off+=2; }
+    return new Blob([view], {type:'audio/wav'});
+  }
+
+  function addEventRow(type, dB, z, note="", clipBlob=null){
+    const tr=document.createElement('tr');
+    const t=nowT();
+    let clipCell='';
+    if (clipBlob){
+      const url=URL.createObjectURL(clipBlob);
+      clipCell = `<a class="pill" href="${url}" download="clip_${t.replaceAll(':','-')}.wav">clip</a>`;
+    }
+    tr.innerHTML = `<td>${t}</td><td>${type}</td><td>${dB.toFixed(1)}</td><td>${z.toFixed(2)}</td><td>${clipCell}</td><td contenteditable="true">${note}</td>`;
+    eventsTbody.appendChild(tr);
+    events.push({time:new Date().toISOString(), local_time:t, type, dB:+dB.toFixed(1), z:+z.toFixed(2), note, clip: !!clipBlob});
+    btnCSV.disabled = btnJSON.disabled = false;
+  }
+
+  function exportCSV(){
+    const headers=["time_iso","time_local","type","dB_weighted_rel","z","note","clip","weighting"];
+    const rows=events.map(e=>[e.time,e.local_time,e.type,e.dB,e.z,`"${(e.note||"").replace(/"/g,'""')}"`,e.clip, weightingEl.value].join(','));
+    const csv=[headers.join(','),...rows].join('\n');
+    const blob=new Blob([csv],{type:'text/csv'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='eventi_rumore.csv'; a.click();
+  }
+  function exportJSON(){
+    const blob=new Blob([JSON.stringify({weighting:weightingEl.value,events},null,2)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='eventi_rumore.json'; a.click();
+  }
+  btnCSV.onclick = exportCSV; btnJSON.onclick = exportJSON;
+
+  // Avvio (iOS: tutto dopo tap)
+  btnStart.addEventListener('click', async ()=>{
+    try{
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC(); await audioCtx.resume();
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio:{channelCount:1, noiseSuppression:false, echoCancellation:false, autoGainControl:false},
+        video:false
+      });
+      micSrc = audioCtx.createMediaStreamSource(stream);
+
+      analyserFreq = audioCtx.createAnalyser();
+      analyserFreq.fftSize = 4096;
+      analyserFreq.smoothingTimeConstant = 0.6;
+      micSrc.connect(analyserFreq);
+
+      // ScriptProcessor per ring buffer (compat Safari)
+      const sp = audioCtx.createScriptProcessor(2048, 1, 1);
+      micSrc.connect(sp); sp.connect(audioCtx.destination);
+      setupRing(audioCtx.sampleRate, Math.max(3, parseFloat(clipDurEl.value)||3) + 1);
+      sp.onaudioprocess = (e)=>{ if(running){ ringPush(e.inputBuffer.getChannelData(0)); } };
+
+      // Unico MediaRecorder per traccia completa
+      let mime=''; if (window.MediaRecorder){
+        if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/mp4')) mime='audio/mp4';
+        else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) mime='audio/webm';
+      }
+      const mr = new MediaRecorder(stream, mime?{mimeType:mime}:{});
+      mediaRecorder=mr; recChunks=[];
+      mr.ondataavailable = e => { if (e.data.size>0) recChunks.push(e.data); };
+      mr.onstop = ()=>{
+        const blob=new Blob(recChunks,{type:mime||'audio/mp4'});
+        const url=URL.createObjectURL(blob);
+        const ext = (mime && mime.includes('webm'))?'webm':'m4a';
+        audioLink.href=url; audioLink.download=`registrazione.${ext}`; audioLink.hidden=false;
+      };
+      mr.start();
+
+      running=true;
+      btnStart.disabled=true; btnStop.disabled=btnMark.disabled=false;
+      recDot.classList.add('on'); recTxt.textContent='Registrazione attiva';
+
+      // Loop 10 Hz
+      const spec = new Float32Array(analyserFreq.frequencyBinCount);
+      (function tick(){
+        if(!running) return;
+        analyserFreq.getFloatFrequencyData(spec);
+
+        const mode = weightingEl.value; // 'A' | 'C' | 'Z'
+        let dBw = dB_weighted_from_spectrum(spec, audioCtx.sampleRate, mode);
+        dBw += (parseFloat(calOffEl.value)||0); // offset
+
+        rolling.push(dBw);
+        if (rolling.length > ROLLING_SEC*HZ) rolling.shift();
+
+        const {mean,std} = stats(rolling);
+        const z = (dBw - mean)/(std||1);
+
+        lvlEl.textContent = isFinite(dBw)? dBw.toFixed(1) : '--';
+        avgEl.textContent = isFinite(mean)? mean.toFixed(1) : '--';
+        zEl.textContent   = isFinite(z)? z.toFixed(2) : '--';
+
+        const zThr = parseFloat(zThreshEl.value)||3;
+        const minDur= parseFloat(minDurEl.value)||0.5;
+        const now = performance.now()/1000;
+
+        if (z >= zThr) {
+          if (segmentStart===null) segmentStart = now;
+        } else if (segmentStart!==null) {
+          const dur = now - segmentStart;
+          if (dur >= minDur) {
+            const clipDur = Math.max(0.5, parseFloat(clipDurEl.value)||3);
+            const floatPCM = ringGrab(clipDur);
+            const clipBlob = floatTo16LEPCM(floatPCM);
+            addEventRow('anomalia', dBw, z, `auto (${mode})`, clipBlob);
+          }
+          segmentStart=null;
+        }
+
+        setTimeout(()=>requestAnimationFrame(tick), 100);
+      })();
+
+    } catch(err){
+      alert('Avvio fallito: ' + err.message + '\nUsa HTTPS o http://localhost su iPhone e consenti il microfono.');
+      console.error(err);
+    }
+  });
+
+  btnStop.addEventListener('click', ()=>{
+    running=false;
+    recDot.classList.remove('on'); recTxt.textContent='Inattivo';
+    btnStart.disabled=false; btnStop.disabled=btnMark.disabled=true;
+    try{ mediaRecorder && mediaRecorder.state!=='inactive' && mediaRecorder.stop(); }catch(_){}
+  });
+
+  btnMark.addEventListener('click', ()=>{
+    const last = rolling.at(-1) ?? 0;
+    addEventRow('manuale', last, 0, `annota evento (${weightingEl.value})`, null);
+  });
+
+})();
+</script>
+</body>
+</html>
